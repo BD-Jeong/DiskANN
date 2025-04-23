@@ -53,7 +53,8 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                       const uint32_t num_threads, const uint32_t recall_at, const uint32_t beamwidth,
                       const uint32_t num_nodes_to_cache, const uint32_t search_io_limit,
                       const std::vector<uint32_t> &Lvec, const float fail_if_recall_below,
-                      const std::vector<std::string> &query_filters, const bool use_reorder_data = false)
+                      const std::vector<std::string> &query_filters, const bool use_reorder_data = false, 
+                      const bool overlay_medoid = false)
 {
     diskann::cout << "Search parameters: #threads: " << num_threads << ", ";
     if (beamwidth <= 0)
@@ -119,6 +120,14 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         return res;
     }
 
+    if (overlay_medoid)
+    {
+        std::thread overlay_thread([&_pFlashIndex]() {
+            _pFlashIndex->use_overlay_medoid();   
+        });
+        overlay_thread.detach();
+    }
+
     std::vector<uint32_t> node_list;
     diskann::cout << "Caching " << num_nodes_to_cache << " nodes around medoid(s)" << std::endl;
     _pFlashIndex->cache_bfs_levels(num_nodes_to_cache, node_list);
@@ -179,7 +188,8 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
     std::string recall_string = "Recall@" + std::to_string(recall_at);
     diskann::cout << std::setw(6) << "L" << std::setw(12) << "Beamwidth" << std::setw(16) << "QPS" << std::setw(16)
                   << "Mean Latency" << std::setw(16) << "99.9 Latency" << std::setw(16) << "Mean IOs" << std::setw(16)
-                  << "Mean IO (us)" << std::setw(16) << "CPU (s)";
+                  << "Mean IO (us)" << std::setw(16) << "CPU (s)"
+                  << std::setw(16) << "N_MEDOID" << std::setw(16) << "N_OV_MEDOID" << std::setw(16) << "HOPS";
     if (calc_recall_flag)
     {
         diskann::cout << std::setw(16) << recall_string << std::endl;
@@ -273,6 +283,15 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         auto mean_io_us = diskann::get_mean_stats<float>(stats, query_num,
                                                          [](const diskann::QueryStats &stats) { return stats.io_us; });
 
+        auto mean_use_med = diskann::get_mean_stats<uint32_t>(stats, query_num,
+                                                         [](const diskann::QueryStats &stats) { return stats.n_use_org_medoid; });
+
+        auto mean_use_ov_med = diskann::get_mean_stats<uint32_t>(stats, query_num,
+                                                         [](const diskann::QueryStats &stats) { return stats.n_use_overlay_medoids; });
+
+        auto mean_hops = diskann::get_mean_stats<uint32_t>(stats, query_num,
+                                                        [](const diskann::QueryStats &stats) { return stats.n_hops; });
+                                                        
         double recall = 0;
         if (calc_recall_flag)
         {
@@ -283,7 +302,8 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
 
         diskann::cout << std::setw(6) << L << std::setw(12) << optimized_beamwidth << std::setw(16) << qps
                       << std::setw(16) << mean_latency << std::setw(16) << latency_999 << std::setw(16) << mean_ios
-                      << std::setw(16) << mean_io_us << std::setw(16) << mean_cpuus;
+                      << std::setw(16) << mean_io_us << std::setw(16) << mean_cpuus
+                      << std::setw(16) << mean_use_med << std::setw(16) << mean_use_ov_med << std::setw(16) << mean_hops;
         if (calc_recall_flag)
         {
             diskann::cout << std::setw(16) << recall << std::endl;
@@ -320,6 +340,7 @@ int main(int argc, char **argv)
     uint32_t num_threads, K, W, num_nodes_to_cache, search_io_limit;
     std::vector<uint32_t> Lvec;
     bool use_reorder_data = false;
+    bool overlay_medoid = false;
     float fail_if_recall_below = 0.0f;
 
     po::options_description desc{
@@ -364,6 +385,8 @@ int main(int argc, char **argv)
         optional_configs.add_options()("use_reorder_data", po::bool_switch()->default_value(false),
                                        "Include full precision data in the index. Use only in "
                                        "conjuction with compressed data on SSD.  Default value: false");
+        optional_configs.add_options()("overlay_medoid", po::bool_switch()->default_value(false),
+                                        "Use overlay medoid for search.  Default value: false");
         optional_configs.add_options()("filter_label",
                                        po::value<std::string>(&filter_label)->default_value(std::string("")),
                                        program_options_utils::FILTER_LABEL_DESCRIPTION);
@@ -389,6 +412,8 @@ int main(int argc, char **argv)
         po::notify(vm);
         if (vm["use_reorder_data"].as<bool>())
             use_reorder_data = true;
+        if (vm["overlay_medoid"].as<bool>())
+            overlay_medoid = true;
     }
     catch (const std::exception &ex)
     {
@@ -454,15 +479,15 @@ int main(int argc, char **argv)
             if (data_type == std::string("float"))
                 return search_disk_index<float, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
-                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data);
+                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data, overlay_medoid);
             else if (data_type == std::string("int8"))
                 return search_disk_index<int8_t, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
-                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data);
+                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data, overlay_medoid);
             else if (data_type == std::string("uint8"))
                 return search_disk_index<uint8_t, uint16_t>(
                     metric, index_path_prefix, result_path_prefix, query_file, gt_file, num_threads, K, W,
-                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data);
+                    num_nodes_to_cache, search_io_limit, Lvec, fail_if_recall_below, query_filters, use_reorder_data, overlay_medoid);
             else
             {
                 std::cerr << "Unsupported data type. Use float or int8 or uint8" << std::endl;
@@ -474,15 +499,15 @@ int main(int argc, char **argv)
             if (data_type == std::string("float"))
                 return search_disk_index<float>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                 num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
-                                                fail_if_recall_below, query_filters, use_reorder_data);
+                                                fail_if_recall_below, query_filters, use_reorder_data, overlay_medoid);
             else if (data_type == std::string("int8"))
                 return search_disk_index<int8_t>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                  num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
-                                                 fail_if_recall_below, query_filters, use_reorder_data);
+                                                 fail_if_recall_below, query_filters, use_reorder_data, overlay_medoid);
             else if (data_type == std::string("uint8"))
                 return search_disk_index<uint8_t>(metric, index_path_prefix, result_path_prefix, query_file, gt_file,
                                                   num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec,
-                                                  fail_if_recall_below, query_filters, use_reorder_data);
+                                                  fail_if_recall_below, query_filters, use_reorder_data, overlay_medoid);
             else
             {
                 std::cerr << "Unsupported data type. Use float or int8 or uint8" << std::endl;

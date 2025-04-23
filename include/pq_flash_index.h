@@ -89,6 +89,7 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
                                             QueryStats *stats = nullptr);
 
     DISKANN_DLLEXPORT uint64_t get_data_dim();
+    DISKANN_DLLEXPORT void use_overlay_medoid();
 
     std::shared_ptr<AlignedFileReader> &reader;
 
@@ -123,7 +124,7 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     DISKANN_DLLEXPORT void generate_random_labels(std::vector<LabelT> &labels, const uint32_t num_labels,
                                                   const uint32_t nthreads);
     void reset_stream_for_reading(std::basic_istream<char> &infile);
-
+    void update_aging_table(uint32_t medoid_id, uint32_t vector_id);
     // sector # on disk where node_id is present with in the graph part
     DISKANN_DLLEXPORT uint64_t get_node_sector(uint64_t node_id);
 
@@ -198,8 +199,18 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     // graph has one entry point by default,
     // we can optionally have multiple starting points
     uint32_t *_medoids = nullptr;
+    uint32_t *_overlay_medoids = nullptr;
     // defaults to 1
     size_t _num_medoids;
+
+    static constexpr uint64_t OVERLAY_MEDOID_TIME_INTV = 2; // 5 * 60; // 300s
+    // 24 bytes per entry (safe upper bound)
+    // 1 medoid with 1K entries -> ~24 KB
+    const size_t MAX_ENTRY_PER_MEDOID = 1000;
+    const size_t TOP_K_PER_MEDOID = 1;
+    std::vector<std::unordered_map<uint32_t, uint16_t>> _aging_table;
+    bool USE_OVERLAY_MEDOID = false;
+
     // by default, it is empty. If there are multiple
     // centroids, we pick the medoid corresponding to the
     // closest centroid as the starting point of search

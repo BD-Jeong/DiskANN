@@ -603,6 +603,83 @@ void PQFlashIndex<T, LabelT>::reset_stream_for_reading(std::basic_istream<char> 
     infile.seekg(0);
 }
 
+template <typename T, typename LabelT> 
+void PQFlashIndex<T, LabelT>::update_aging_table(uint32_t medoid_id, uint32_t vector_id)
+{
+    auto& table = _aging_table[medoid_id];
+
+    // if existing, update the age of the vector
+    auto it = table.find(vector_id);
+    if (it != table.end())
+    {
+        if (it->second < std::numeric_limits<uint16_t>::max())
+        {
+            it->second++;
+        }
+        else
+        {
+            // if the age is already max, we don't need to increment it further
+            diskann::cout << "[DCC] Warning: Age of vector " << vector_id << " for medoid " << medoid_id << " is already at max." << std::endl;
+        }
+    }
+    else
+    {
+        // if not existing, add the vector with age 1
+        if (table.size() < MAX_ENTRY_PER_MEDOID)
+        {
+            table[vector_id] = 1;
+        }
+        else
+        {
+            // if the table is full, we can either remove the oldest entry or ignore the new entry
+            // for simplicity, we will ignore the new entry in this example
+            // diskann::cout << "[DCC] Warning: Aging table for medoid " << medoid_id << " is full. Ignoring new entry." << std::endl;
+        }
+    }
+}
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::use_overlay_medoid()
+{
+    USE_OVERLAY_MEDOID = true;
+    _aging_table.resize(_num_medoids);
+    _overlay_medoids = new uint32_t[_num_medoids];
+    std::copy(_medoids, _medoids + _num_medoids, _overlay_medoids);
+
+    diskann::cout << "\n[DCC] Using overlay medoids." << std::endl;
+    diskann::cout << "[DCC] Aging table resized to num_medoids: " << _num_medoids << std::endl;
+    while (true)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(OVERLAY_MEDOID_TIME_INTV));
+        for (size_t m_id = 0; m_id < _num_medoids; ++m_id)
+        {
+            // 1. get top-k vector id with the highest age for each medoid
+            const auto& table = _aging_table[m_id];
+            if (table.empty())
+            {
+                continue;
+            }
+            std::vector<std::pair<uint32_t, uint16_t>> entries(table.begin(), table.end());
+            std::partial_sort(entries.begin(), entries.begin() + std::min(TOP_K_PER_MEDOID, entries.size()), entries.end(),
+                [](const auto& a, const auto& b) 
+                {
+                    return a.second > b.second; // Sort in descending order of age
+                });       
+            // for debugging
+            for (size_t i = 0  ; i < std::min(TOP_K_PER_MEDOID, entries.size()); ++i)
+            {
+                diskann::cout << "[DCC] Medoid " << m_id << " - Vector ID: " << entries[i].first << ", Age: " << entries[i].second << std::endl;
+            }
+            // 2. update the overlay medoid with the vector id
+            // 일단, 임시적으로 aging이 가장 높은 vector id를 overlay medoid로 설정
+            _overlay_medoids[m_id] = entries[0].first;
+            diskann::cout << "[DCC] Overlay medoid for medoid " << m_id << " updated to vector ID: " << _overlay_medoids[m_id] << std::endl;
+            // 3. reset the aging table for the medoid
+            _aging_table[m_id].clear(); 
+            diskann::cout << "[DCC] Aging table for medoid " << m_id << " reset." << std::endl;
+        }
+    }
+}
+
 template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::get_label_file_metadata(const std::string &fileContent, uint32_t &num_pts,
                                                       uint32_t &num_total_labels)
@@ -1358,6 +1435,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     std::vector<Neighbor> &full_retset = query_scratch->full_retset;
 
     uint32_t best_medoid = 0;
+    uint32_t best_medoid_id = 0;
     float best_dist = (std::numeric_limits<float>::max)();
     if (!use_filter)
     {
@@ -1368,7 +1446,36 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             if (cur_expanded_dist < best_dist)
             {
                 best_medoid = _medoids[cur_m];
+                best_medoid_id = cur_m;
                 best_dist = cur_expanded_dist;
+            }
+        }
+        if (USE_OVERLAY_MEDOID)
+        {
+            compute_dists(&_overlay_medoids[best_medoid_id], 1, dist_scratch);
+            float overlay_dist = dist_scratch[0];
+            if (overlay_dist < best_dist)
+            {
+                best_medoid = _overlay_medoids[best_medoid_id];
+                best_dist = overlay_dist;
+                if (stats != nullptr)
+                {
+                    stats->n_use_overlay_medoids++;
+                }
+            }
+            else
+            {
+                if (stats != nullptr)
+                {
+                    stats->n_use_org_medoid++;
+                }
+            }
+        }
+        else
+        {
+            if (stats != nullptr)
+            {
+                stats->n_use_org_medoid++;
             }
         }
     }
@@ -1662,7 +1769,17 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
 
         std::sort(full_retset.begin(), full_retset.end());
     }
-
+    // update aging table with the best medoid id
+    if (USE_OVERLAY_MEDOID)
+    {
+        if (k_search > 0 && !full_retset.empty())
+        {
+            for (uint64_t i = 0; i < k_search; i++)
+            {
+                update_aging_table(best_medoid_id, full_retset[i].id);
+            }
+        }
+    }
     // copy k_search values
     for (uint64_t i = 0; i < k_search; i++)
     {
