@@ -647,6 +647,17 @@ void PQFlashIndex<T, LabelT>::get_label_file_metadata(const std::string &fileCon
                   << std::endl;
 }
 
+
+template <typename T, typename LabelT>
+void PQFlashIndex<T, LabelT>::use_overlay_medoid()
+{
+    USE_OVERLAY_MEDOID = true;
+    _overlay_medoids = new uint32_t[_num_medoids];
+    std::copy(_medoids, _medoids + _num_medoids, _overlay_medoids);
+
+    diskann::cout << "\n[DCC] Using overlay medoids." << std::endl;
+}
+
 template <typename T, typename LabelT>
 inline bool PQFlashIndex<T, LabelT>::point_has_label(uint32_t point_id, LabelT label_id)
 {
@@ -1358,6 +1369,9 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     std::vector<Neighbor> &full_retset = query_scratch->full_retset;
 
     uint32_t best_medoid = 0;
+    uint32_t best_medoid_idx =0;
+    bool use_ov_medoid = false;
+
     float best_dist = (std::numeric_limits<float>::max)();
     if (!use_filter)
     {
@@ -1368,8 +1382,32 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             if (cur_expanded_dist < best_dist)
             {
                 best_medoid = _medoids[cur_m];
+                best_medoid_idx = cur_m;
                 best_dist = cur_expanded_dist;
             }
+        }
+
+        if (USE_OVERLAY_MEDOID)
+        {
+            compute_dists(&_overlay_medoids[best_medoid_idx], 1, dist_scratch);
+            float overlay_dist = dist_scratch[0];
+            if (1 * overlay_dist < best_dist) // distance ratio 조절 
+            {
+                //diskann::cout <<"medoid id: " << best_medoid << ", ov_medoid id: " << _overlay_medoids[best_medoid_idx] << std::endl;
+                //diskann::cout << "best dist: " << best_dist << ", overlay dist: " << overlay_dist << std::endl;
+                best_medoid = _overlay_medoids[best_medoid_idx];
+                best_dist = overlay_dist;
+                use_ov_medoid = true;
+                if (stats != nullptr) stats->n_use_overlay_medoids++;
+            }
+            else
+            {
+                if (stats != nullptr) stats->n_use_org_medoid++;
+            }
+        }
+        else
+        {
+            if (stats != nullptr) stats->n_use_org_medoid++;
         }
     }
     else
@@ -1451,7 +1489,15 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         if (!frontier.empty())
         {
             if (stats != nullptr)
+            {
                 stats->n_hops++;
+                
+                if (use_ov_medoid) stats->n_ov_me_hops++;
+                else
+                {
+                    stats->n_me_hops++;
+                }
+            }
             for (uint64_t i = 0; i < frontier.size(); i++)
             {
                 auto id = frontier[i];
@@ -1500,7 +1546,11 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                     cur_expanded_dist = _disk_pq_table.l2_distance( // disk_pq does not support OPQ yet
                         query_float, (uint8_t *)node_fp_coords_copy);
             }
-            full_retset.push_back(Neighbor((uint32_t)cached_nhood.first, cur_expanded_dist));
+            // diskann::cout << "### test degree: " << cached_nhood.second.first << "max: " << _max_degree << std::endl;
+            if (USE_OVERLAY_MEDOID)
+                full_retset.push_back(Neighbor((uint32_t)cached_nhood.first, cur_expanded_dist, static_cast<uint16_t>(cached_nhood.second.first)));
+            else
+                full_retset.push_back(Neighbor((uint32_t)cached_nhood.first, cur_expanded_dist));
 
             uint64_t nnbrs = cached_nhood.second.first;
             uint32_t *node_nbrs = cached_nhood.second.second;
@@ -1565,7 +1615,12 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 else
                     cur_expanded_dist = _disk_pq_table.l2_distance(query_float, (uint8_t *)data_buf);
             }
-            full_retset.push_back(Neighbor(frontier_nhood.first, cur_expanded_dist));
+
+            if (USE_OVERLAY_MEDOID)
+                full_retset.push_back(Neighbor(frontier_nhood.first, cur_expanded_dist, static_cast<uint16_t>(nnbrs)));
+            else
+                full_retset.push_back(Neighbor(frontier_nhood.first, cur_expanded_dist));
+
             uint32_t *node_nbrs = (node_buf + 1);
             // compute node_nbrs <-> query dist in PQ space
             cpu_timer.reset();
@@ -1661,6 +1716,72 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         }
 
         std::sort(full_retset.begin(), full_retset.end());
+    }
+    
+    if (USE_OVERLAY_MEDOID)
+    {
+        // 1. simple 
+        /*
+        if (k_search > 0 && !full_retset.empty())
+        { 
+            if (full_retset[0].degree < _max_degree)
+                diskann::cout << "ov_medoid degree(<MAX): " << full_retset[0].degree << ", MAX: " << _max_degree << std::endl;
+                _overlay_medoids[best_medoid_idx] = full_retset[0].id;
+        }
+        */
+        // 2. path quality check
+        if (k_search > 0 && !full_retset.empty()) {
+            uint32_t leaf_candidate = full_retset[0].id;
+            float dist_leaf_query = full_retset[0].distance;
+    
+            // neighbors of leaf_candidate
+            // 1. check if already in cache
+            uint64_t nnbrs = 0;
+            uint32_t *node_nbrs = nullptr;
+            {
+                auto cache_iter = _nhood_cache.find(leaf_candidate);
+                if (cache_iter != _nhood_cache.end()) {
+                    nnbrs = cache_iter->second.first;
+                    node_nbrs = cache_iter->second.second;
+                } else {
+                    // 2. read from disk
+                    std::vector<AlignedRead> read_reqs;
+                    read_reqs.emplace_back(
+                        get_node_sector((size_t)leaf_candidate) * defaults::SECTOR_LEN,
+                        num_sectors_per_node * defaults::SECTOR_LEN,
+                        query_scratch->sector_scratch
+                    );
+                    reader->read(read_reqs, ctx);
+    
+                    char *node_disk_buf = offset_to_node(query_scratch->sector_scratch, leaf_candidate);
+                    uint32_t *node_buf = offset_to_node_nhood(node_disk_buf);
+                    nnbrs = (uint64_t)(*node_buf);
+                    node_nbrs = node_buf + 1;
+                }
+            }
+    
+            // compute node_nbrs <-> query dist in PQ space
+            size_t better_neighbors = 0;
+    
+            if (nnbrs > 0) {
+                compute_dists(node_nbrs, nnbrs, dist_scratch);
+                for (uint64_t i = 0; i < nnbrs; ++i) {
+                    float dist_neighbor_query = dist_scratch[i];
+                    if (dist_neighbor_query < dist_leaf_query) {
+                        better_neighbors++;
+                    }
+                }
+            }
+    
+            float path_quality_score = (nnbrs > 0) ? (float)better_neighbors / nnbrs : 0.0f;
+    
+            // path quality threshold
+            const float PATH_QUALITY_THRESHOLD = 0.3f; // 30% of neighbors are better than the leaf
+    
+            if (path_quality_score >= PATH_QUALITY_THRESHOLD) {
+                _overlay_medoids[best_medoid_idx] = leaf_candidate;
+            }
+        }
     }
 
     // copy k_search values

@@ -33,6 +33,10 @@ struct QueryStats
     unsigned n_cmps = 0;       // # cmps
     unsigned n_cache_hits = 0; // # cache_hits
     unsigned n_hops = 0;       // # search hops
+    unsigned n_me_hops = 0;       // # medoid hops
+    unsigned n_ov_me_hops = 0;       // # overlay medoid hops
+    unsigned n_use_org_medoid = 0; // # use original medoid
+    unsigned n_use_overlay_medoids = 0; // # use overlay medoid
 };
 
 template <typename T>

@@ -13,13 +13,19 @@ namespace diskann
 
 struct Neighbor
 {
-    unsigned id;
-    float distance;
-    bool expanded;
+    unsigned id; // 4 bytes
+    float distance; // 4 bytes
+    bool expanded; // 1 byte
+    uint16_t degree; // 2 bytes
+    uint16_t padding; // 2 bytes
+    // 4 bytes padding to make the struct size 16 bytes
 
     Neighbor() = default;
 
     Neighbor(unsigned id, float distance) : id{id}, distance{distance}, expanded(false)
+    {
+    }
+    Neighbor(unsigned id, float distance, uint16_t degree) : id{id}, distance{distance}, expanded(false), degree(degree)
     {
     }
 

@@ -89,6 +89,7 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
                                             QueryStats *stats = nullptr);
 
     DISKANN_DLLEXPORT uint64_t get_data_dim();
+    DISKANN_DLLEXPORT void use_overlay_medoid();
 
     std::shared_ptr<AlignedFileReader> &reader;
 
@@ -198,6 +199,8 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
     // graph has one entry point by default,
     // we can optionally have multiple starting points
     uint32_t *_medoids = nullptr;
+    uint32_t *_overlay_medoids = nullptr;
+    bool USE_OVERLAY_MEDOID = false;
     // defaults to 1
     size_t _num_medoids;
     // by default, it is empty. If there are multiple
