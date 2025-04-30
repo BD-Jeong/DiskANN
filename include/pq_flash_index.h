@@ -89,7 +89,7 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
                                             QueryStats *stats = nullptr);
 
     DISKANN_DLLEXPORT uint64_t get_data_dim();
-    DISKANN_DLLEXPORT void use_overlay_medoid();
+    DISKANN_DLLEXPORT void use_overlay_medoid(const float local_dist_threshold, const float path_qual_threshold);
 
     std::shared_ptr<AlignedFileReader> &reader;
 
@@ -205,11 +205,14 @@ template <typename T, typename LabelT = uint32_t> class PQFlashIndex
 
     static constexpr uint64_t OVERLAY_MEDOID_TIME_INTV = 2; // 5 * 60; // 300s
     // 24 bytes per entry (safe upper bound)
-    // 1 medoid with 1K entries -> ~24 KB
-    const size_t MAX_ENTRY_PER_MEDOID = 1000;
-    const size_t TOP_K_PER_MEDOID = 1;
+    // 100K entries -> ~2.4 MB
+    const size_t MAX_ENTRY_AGING_TABLE = 100000;
+    uint32_t aging_table_entry_cnt = 0;
+    const size_t TOP_K_PER_MEDOID = 10;
     std::vector<std::unordered_map<uint32_t, uint16_t>> _aging_table;
     bool USE_OVERLAY_MEDOID = false;
+    float LOCAL_DIST_THRESHOLD = 0.0f;
+    float PATH_QUALITY_THRESHOLD = 0.0f;
 
     // by default, it is empty. If there are multiple
     // centroids, we pick the medoid corresponding to the

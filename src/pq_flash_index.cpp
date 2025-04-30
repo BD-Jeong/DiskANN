@@ -625,8 +625,9 @@ void PQFlashIndex<T, LabelT>::update_aging_table(uint32_t medoid_id, uint32_t ve
     else
     {
         // if not existing, add the vector with age 1
-        if (table.size() < MAX_ENTRY_PER_MEDOID)
+        if (aging_table_entry_cnt < MAX_ENTRY_AGING_TABLE)
         {
+            aging_table_entry_cnt++;
             table[vector_id] = 1;
         }
         else
@@ -638,47 +639,147 @@ void PQFlashIndex<T, LabelT>::update_aging_table(uint32_t medoid_id, uint32_t ve
     }
 }
 template <typename T, typename LabelT>
-void PQFlashIndex<T, LabelT>::use_overlay_medoid()
+void PQFlashIndex<T, LabelT>::use_overlay_medoid(const float local_dist_threshold, const float path_qual_threshold)
 {
     USE_OVERLAY_MEDOID = true;
     _aging_table.resize(_num_medoids);
     _overlay_medoids = new uint32_t[_num_medoids];
     std::copy(_medoids, _medoids + _num_medoids, _overlay_medoids);
 
-    diskann::cout << "\n[DCC] Using overlay medoids." << std::endl;
-    diskann::cout << "[DCC] Aging table resized to num_medoids: " << _num_medoids << std::endl;
+    LOCAL_DIST_THRESHOLD = local_dist_threshold; //default 100000.0f
+    PATH_QUALITY_THRESHOLD = path_qual_threshold; // default 0.7f
+
+    diskann::cout << "\033[32m\n[DCC] Using overlay medoids.\033[0m" << std::endl;
+    diskann::cout << "\033[32m[DCC] Aging table resized to num_medoids: " << _num_medoids << "\033[0m" << std::endl;
+    diskann::cout << "\033[32m[DCC] =========== Paramter Info ================\033[0m" << std::endl;
+    diskann::cout << "\033[32m 1. MAX_ENTRY_AGING_TABLE: " << MAX_ENTRY_AGING_TABLE << "\033[0m" << std::endl;
+    diskann::cout << "\033[32m 2. TOP_K_PER_MEDOID: " << TOP_K_PER_MEDOID << "\033[0m" << std::endl;
+    diskann::cout << "\033[32m 3. LOCAL_DIST_THRESHOLD: " << LOCAL_DIST_THRESHOLD << "\033[0m" << std::endl;
+    diskann::cout << "\033[32m 4. PATH_QUALITY_THRESHOLD: " << PATH_QUALITY_THRESHOLD << "\033[0m" << std::endl;
+
+    uint64_t num_sectors_per_node = (_nnodes_per_sector > 0) ? 1 : DIV_ROUND_UP(_max_node_len, defaults::SECTOR_LEN);
+    std::vector<char> sector_scratch(num_sectors_per_node * defaults::SECTOR_LEN);
+    
     while (true)
     {
         std::this_thread::sleep_for(std::chrono::seconds(OVERLAY_MEDOID_TIME_INTV));
         for (size_t m_id = 0; m_id < _num_medoids; ++m_id)
         {
-            // 1. get top-k vector id with the highest age for each medoid
             const auto& table = _aging_table[m_id];
             if (table.empty())
-            {
                 continue;
-            }
+
             std::vector<std::pair<uint32_t, uint16_t>> entries(table.begin(), table.end());
             std::partial_sort(entries.begin(), entries.begin() + std::min(TOP_K_PER_MEDOID, entries.size()), entries.end(),
-                [](const auto& a, const auto& b) 
-                {
-                    return a.second > b.second; // Sort in descending order of age
-                });       
-            // for debugging
-            for (size_t i = 0  ; i < std::min(TOP_K_PER_MEDOID, entries.size()); ++i)
+                [](const auto& a, const auto& b) { return a.second > b.second; });
+
+            bool overlay_updated = false;
+            for (size_t i = 0; i < std::min(TOP_K_PER_MEDOID, entries.size()); ++i)
             {
-                diskann::cout << "[DCC] Medoid " << m_id << " - Vector ID: " << entries[i].first << ", Age: " << entries[i].second << std::endl;
+                uint32_t candidate_id = entries[i].first;
+
+                uint64_t nnbrs = 0;
+                uint32_t* node_nbrs = nullptr;
+                {
+                    auto cache_iter = _nhood_cache.find(candidate_id);
+                    if (cache_iter != _nhood_cache.end())
+                    {
+                        nnbrs = cache_iter->second.first;
+                        node_nbrs = cache_iter->second.second;
+                    }
+                    else
+                    {
+                        std::vector<char> sector_scratch(num_sectors_per_node * defaults::SECTOR_LEN);
+                        uint64_t candidate_sector_offset = get_node_sector(candidate_id) * defaults::SECTOR_LEN;
+                        std::vector<AlignedRead> read_reqs;
+                        read_reqs.emplace_back(candidate_sector_offset, num_sectors_per_node * defaults::SECTOR_LEN, sector_scratch.data());
+
+                        ScratchStoreManager<SSDThreadData<T>> manager(this->_thread_data);
+                        auto this_thread_data = manager.scratch_space();
+                        IOContext& ctx = this_thread_data->ctx;
+
+                        reader->read(read_reqs, ctx);
+
+                        char* node_buf = offset_to_node(sector_scratch.data(), candidate_id);
+                        uint32_t* node_nhood = offset_to_node_nhood(node_buf);
+                        nnbrs = *node_nhood;
+                        node_nbrs = node_nhood + 1;
+
+                    }
+                }
+
+                if (nnbrs < _max_degree) {
+                    //diskann::cout << "[DCC] Check Medoid " << m_id << " - Vector ID: " << candidate_id << " has insufficient neighbors.:" << nnbrs << std::endl;
+                    continue;
+                }
+                // candidate feature
+                std::vector<T*> coord_buffers(1, nullptr);
+                std::vector<std::pair<uint32_t, uint32_t*>> nbr_buffers(1, {0, nullptr});
+                std::vector<uint32_t> node_ids = {candidate_id};
+
+                T* candidate_coords;
+                diskann::alloc_aligned((void**)&candidate_coords, _aligned_dim * sizeof(T), 8 * sizeof(T));
+                coord_buffers[0] = candidate_coords;
+                read_nodes(node_ids, coord_buffers, nbr_buffers);
+                float* candidate_feature = reinterpret_cast<float*>(candidate_coords);
+
+                size_t close_neighbor_count = 0;
+
+                for (size_t j = 0; j < nnbrs; ++j) {
+                    uint32_t neighbor_id = node_nbrs[j];
+
+                    T* neighbor_coords;
+                    diskann::alloc_aligned((void**)&neighbor_coords, _aligned_dim * sizeof(T), 8 * sizeof(T));
+                    std::vector<T*> neighbor_coord_buffers(1, neighbor_coords);
+                    std::vector<std::pair<uint32_t, uint32_t*>> neighbor_nbr_buffers(1, {0, nullptr});
+                    std::vector<uint32_t> neighbor_node_ids = {neighbor_id};
+                    read_nodes(neighbor_node_ids, neighbor_coord_buffers, neighbor_nbr_buffers);
+
+                    float* neighbor_feature = reinterpret_cast<float*>(neighbor_coords);
+
+                    float dist = _dist_cmp_float->compare(candidate_feature, neighbor_feature, _aligned_dim);
+                    //diskann::cout << "[DCC] Medoid " << m_id << " - Vector ID: " << candidate_id
+                    //              << " Neighbor ID (j): " << neighbor_id << " (" << j << ") " << " Distance: " << dist << std::endl;
+
+                    if (dist < LOCAL_DIST_THRESHOLD) 
+                    {
+                        close_neighbor_count++;
+                        //diskann::cout << "[DCC] Medoid " << m_id << " - Vector ID: " << candidate_id
+                        //          << " Neighbor ID (j): " << neighbor_id << " (" << j << ") " << " Distance: " << dist << std::endl;
+                    }
+
+                    aligned_free(neighbor_coords);
+                }
+
+                float path_quality_score = static_cast<float>(close_neighbor_count) / nnbrs;
+
+                if (path_quality_score >= PATH_QUALITY_THRESHOLD) {
+                    _overlay_medoids[m_id] = candidate_id;
+                    overlay_updated = true;
+                    diskann::cout << "[DCC] Overlay medoid for medoid " << m_id
+                                  << " updated to vector ID: " << _overlay_medoids[m_id]
+                                  << " with path quality score: " << path_quality_score << std::endl;
+                    break;
+                }
+
+                aligned_free(candidate_coords);
             }
-            // 2. update the overlay medoid with the vector id
-            // 일단, 임시적으로 aging이 가장 높은 vector id를 overlay medoid로 설정
-            _overlay_medoids[m_id] = entries[0].first;
-            diskann::cout << "[DCC] Overlay medoid for medoid " << m_id << " updated to vector ID: " << _overlay_medoids[m_id] << std::endl;
-            // 3. reset the aging table for the medoid
-            _aging_table[m_id].clear(); 
-            diskann::cout << "[DCC] Aging table for medoid " << m_id << " reset." << std::endl;
+
+            if (!overlay_updated) {
+                _overlay_medoids[m_id] = _medoids[m_id];
+                diskann::cout << "[DCC] Overlay medoid for medoid " << m_id
+                              << " not updated. Keeping original medoid ID: " << _overlay_medoids[m_id] << std::endl;
+                diskann::cout << "[DCC] medoid ID: " << _medoids[m_id] << std::endl;
+            }
+
+            _aging_table[m_id].clear();
+            //diskann::cout << "[DCC] Aging table for medoid " << m_id << " reset." << std::endl;
         }
+        aging_table_entry_cnt = 0;
     }
 }
+
+
 
 template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::get_label_file_metadata(const std::string &fileContent, uint32_t &num_pts,
@@ -1435,7 +1536,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     std::vector<Neighbor> &full_retset = query_scratch->full_retset;
 
     uint32_t best_medoid = 0;
-    uint32_t best_medoid_id = 0;
+    uint32_t best_medoid_idx = 0;
+    bool use_ov_medoid = false;
     float best_dist = (std::numeric_limits<float>::max)();
     if (!use_filter)
     {
@@ -1446,37 +1548,30 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             if (cur_expanded_dist < best_dist)
             {
                 best_medoid = _medoids[cur_m];
-                best_medoid_id = cur_m;
+                best_medoid_idx = cur_m;
                 best_dist = cur_expanded_dist;
             }
         }
         if (USE_OVERLAY_MEDOID)
         {
-            compute_dists(&_overlay_medoids[best_medoid_id], 1, dist_scratch);
+            compute_dists(&_overlay_medoids[best_medoid_idx], 1, dist_scratch);
             float overlay_dist = dist_scratch[0];
-            if (overlay_dist < best_dist)
+            if ((LOCAL_DIST_THRESHOLD < overlay_dist) && (overlay_dist < best_dist)) //distance ratio
+            //if (overlay_dist < best_dist)) //distance ratio
             {
-                best_medoid = _overlay_medoids[best_medoid_id];
+                best_medoid = _overlay_medoids[best_medoid_idx];
                 best_dist = overlay_dist;
-                if (stats != nullptr)
-                {
-                    stats->n_use_overlay_medoids++;
-                }
+                use_ov_medoid = true;
+                if (stats != nullptr) stats->n_use_overlay_medoids++;
             }
             else
             {
-                if (stats != nullptr)
-                {
-                    stats->n_use_org_medoid++;
-                }
+                if (stats != nullptr) stats->n_use_org_medoid++;     
             }
         }
         else
         {
-            if (stats != nullptr)
-            {
-                stats->n_use_org_medoid++;
-            }
+            if (stats != nullptr) stats->n_use_org_medoid++;
         }
     }
     else
@@ -1534,6 +1629,13 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         while (retset.has_unexpanded_node() && frontier.size() < beam_width && num_seen < beam_width)
         {
             auto nbr = retset.closest_unexpanded();
+/*
+            if (use_ov_medoid && nbr.distance < 5000)
+            {
+                diskann::cout << "[EarlyTermination] Early stopping at distance: " << nbr.distance << std::endl;
+                goto early_terminate_search;
+            }
+*/
             num_seen++;
             auto iter = _nhood_cache.find(nbr.id);
             if (iter != _nhood_cache.end())
@@ -1558,8 +1660,16 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         if (!frontier.empty())
         {
             if (stats != nullptr)
+            {
                 stats->n_hops++;
-            for (uint64_t i = 0; i < frontier.size(); i++)
+
+                if (use_ov_medoid) stats->n_ov_me_hops++;
+                else
+                {
+                    stats->n_me_hops++;
+                }
+            }
+                for (uint64_t i = 0; i < frontier.size(); i++)
             {
                 auto id = frontier[i];
                 std::pair<uint32_t, char *> fnhood;
@@ -1607,7 +1717,11 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                     cur_expanded_dist = _disk_pq_table.l2_distance( // disk_pq does not support OPQ yet
                         query_float, (uint8_t *)node_fp_coords_copy);
             }
-            full_retset.push_back(Neighbor((uint32_t)cached_nhood.first, cur_expanded_dist));
+            
+            if (USE_OVERLAY_MEDOID)
+                full_retset.push_back(Neighbor((uint32_t)cached_nhood.first, cur_expanded_dist, static_cast<uint16_t>(cached_nhood.second.first)));
+            else
+                full_retset.push_back(Neighbor((uint32_t)cached_nhood.first, cur_expanded_dist));
 
             uint64_t nnbrs = cached_nhood.second.first;
             uint32_t *node_nbrs = cached_nhood.second.second;
@@ -1672,7 +1786,12 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 else
                     cur_expanded_dist = _disk_pq_table.l2_distance(query_float, (uint8_t *)data_buf);
             }
-            full_retset.push_back(Neighbor(frontier_nhood.first, cur_expanded_dist));
+            
+            if (USE_OVERLAY_MEDOID)
+                full_retset.push_back(Neighbor(frontier_nhood.first, cur_expanded_dist, static_cast<uint16_t>(nnbrs)));
+            else
+                full_retset.push_back(Neighbor(frontier_nhood.first, cur_expanded_dist));
+
             uint32_t *node_nbrs = (node_buf + 1);
             // compute node_nbrs <-> query dist in PQ space
             cpu_timer.reset();
@@ -1717,6 +1836,8 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         hops++;
     }
 
+    
+    early_terminate_search:
     // re-sort by distance
     std::sort(full_retset.begin(), full_retset.end());
 
@@ -1776,7 +1897,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         {
             for (uint64_t i = 0; i < k_search; i++)
             {
-                update_aging_table(best_medoid_id, full_retset[i].id);
+                update_aging_table(best_medoid_idx, full_retset[i].id);
             }
         }
     }
