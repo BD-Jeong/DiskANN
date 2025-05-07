@@ -655,7 +655,7 @@ void PQFlashIndex<T, LabelT>::use_overlay_medoid()
     _overlay_medoids = new uint32_t[_num_medoids];
     std::copy(_medoids, _medoids + _num_medoids, _overlay_medoids);
 
-    diskann::cout << "\n[DCC] Using overlay medoids." << std::endl;
+    diskann::cout << "\n[DCC] Using overlay medoids, number of medoids: "<< _num_medoids << std::endl;
 }
 
 template <typename T, typename LabelT>
@@ -1386,7 +1386,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 best_dist = cur_expanded_dist;
             }
         }
-
+        /*
         if (USE_OVERLAY_MEDOID)
         {
             compute_dists(&_overlay_medoids[best_medoid_idx], 1, dist_scratch);
@@ -1409,6 +1409,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
         {
             if (stats != nullptr) stats->n_use_org_medoid++;
         }
+        */
     }
     else
     {
@@ -1433,10 +1434,31 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             throw ANNException("Cannot find medoid for specified filter.", -1, __FUNCSIG__, __FILE__, __LINE__);
         }
     }
-
+    // Round 0
     compute_dists(&best_medoid, 1, dist_scratch);
     retset.insert(Neighbor(best_medoid, dist_scratch[0]));
     visited.insert(best_medoid);
+
+    // insert the overlay medoid
+    if (USE_OVERLAY_MEDOID && (best_medoid != _overlay_medoids[best_medoid_idx]))
+    {
+        compute_dists(&_overlay_medoids[best_medoid_idx], 1, dist_scratch);
+        float overlay_dist = dist_scratch[0];
+        if (overlay_dist < best_dist) //distance ratio
+        {
+            retset.insert(Neighbor(_overlay_medoids[best_medoid_idx], overlay_dist));
+            visited.insert(_overlay_medoids[best_medoid_idx]);
+            use_ov_medoid = true;
+            if (stats != nullptr) stats->n_use_overlay_medoids++;
+        }
+        else {
+            if (stats != nullptr) stats->n_use_org_medoid++;
+        }
+    } 
+    else
+    {
+        if (stats != nullptr) stats->n_use_org_medoid++;
+    }
 
     uint32_t cmps = 0;
     uint32_t hops = 0;
@@ -1721,14 +1743,15 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     if (USE_OVERLAY_MEDOID)
     {
         // 1. simple 
-        /*
         if (k_search > 0 && !full_retset.empty())
         { 
-            if (full_retset[0].degree < _max_degree)
-                diskann::cout << "ov_medoid degree(<MAX): " << full_retset[0].degree << ", MAX: " << _max_degree << std::endl;
-                _overlay_medoids[best_medoid_idx] = full_retset[0].id;
+            //if (full_retset[0].degree < _max_degree)
+            //    diskann::cout << "ov_medoid degree(<MAX): " << full_retset[0].degree << ", MAX: " << _max_degree << std::endl;
+            
+            _overlay_medoids[best_medoid_idx] = full_retset[0].id;
         }
-        */
+       
+        /*
         // 2. path quality check
         if (k_search > 0 && !full_retset.empty()) {
             uint32_t leaf_candidate = full_retset[0].id;
@@ -1767,7 +1790,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 compute_dists(node_nbrs, nnbrs, dist_scratch);
                 for (uint64_t i = 0; i < nnbrs; ++i) {
                     float dist_neighbor_query = dist_scratch[i];
-                    if (dist_neighbor_query < dist_leaf_query) {
+                    if (dist_neighbor_query < 2*dist_leaf_query) {
                         better_neighbors++;
                     }
                 }
@@ -1780,8 +1803,12 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     
             if (path_quality_score >= PATH_QUALITY_THRESHOLD) {
                 _overlay_medoids[best_medoid_idx] = leaf_candidate;
+            } 
+            else {
+                _overlay_medoids[best_medoid_idx] = best_medoid;
             }
         }
+            */
     }
 
     // copy k_search values
